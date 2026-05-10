@@ -26,6 +26,21 @@ Example::
 
     python train_eval_all_pnv.py --data-dir data120 --gpu 0
     python train_eval_all_pnv.py --data-dir data120 --models Safe_101605 --skip-train
+
+Multi-GPU / Kubernetes: run one process per worker with the same ``--num-gpus`` and a
+distinct ``--gpu-id``. Scenes (sorted) are split by striding: worker *k* gets
+``scenes[k::num_gpus]``. Each worker uses ``CUDA_VISIBLE_DEVICES`` from ``--gpu`` (usually
+``0`` when the scheduler assigns one GPU per pod).
+
+Example (4 workers)::
+
+    python train_eval_all_pnv.py --data-dir /data/pnv --num-gpus 4 --gpu-id 0 --gpu 0
+    python train_eval_all_pnv.py --data-dir /data/pnv --num-gpus 4 --gpu-id 1 --gpu 0
+    # ... gpu-id 2, 3
+
+When ``num-gpus > 1``, the default summary CSV is per-shard
+(``train_eval_summary.shard{k}_of_{n}.csv``) to avoid concurrent append corruption.
+Pass an explicit ``--summary`` path only if you handle merging yourself.
 """
 
 from __future__ import annotations
@@ -131,7 +146,26 @@ def main() -> int:
         default="output/PartNetVideo",
         help="Training output directory (relative to repo root)",
     )
-    parser.add_argument("--gpu", type=int, default=0, help="CUDA device index")
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="CUDA device index passed to CUDA_VISIBLE_DEVICES for child processes",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        dest="num_gpus",
+        help="Total parallel workers; scenes are split across [0, num-gpus)",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        type=int,
+        default=0,
+        dest="gpu_id",
+        help="This worker's index in [0, num-gpus); processes scenes[gpu-id::num-gpus]",
+    )
     parser.add_argument(
         "--models",
         nargs="+",
@@ -178,16 +212,43 @@ def main() -> int:
         )
         return 1
 
-    out_rel = args.output_dir.strip("/")
-    summary_path = (
-        args.summary.resolve()
-        if args.summary is not None and args.summary.is_absolute()
-        else (
-            args.summary.resolve()
-            if args.summary is not None
-            else (repo_root / out_rel / "train_eval_summary.csv").resolve()
+    num_gpus = max(1, int(args.num_gpus))
+    gpu_id = int(args.gpu_id)
+    if gpu_id < 0 or gpu_id >= num_gpus:
+        print(
+            f"--gpu-id must satisfy 0 <= gpu-id < num-gpus (got gpu-id={gpu_id}, num-gpus={num_gpus}).",
+            file=sys.stderr,
         )
-    )
+        return 1
+
+    all_scene_count = len(scenes)
+    if num_gpus > 1:
+        scenes = scenes[gpu_id::num_gpus]
+        print(
+            f"Sharding: gpu-id {gpu_id}/{num_gpus} → {len(scenes)} scene(s) "
+            f"of {all_scene_count} total (stride slice [:: {num_gpus}] starting at {gpu_id}).",
+            flush=True,
+        )
+        if not scenes:
+            print(
+                "No scenes in this shard; exiting successfully (check gpu-id vs dataset size).",
+                flush=True,
+            )
+            return 0
+
+    out_rel = args.output_dir.strip("/")
+    if args.summary is not None:
+        summary_path = (
+            args.summary.resolve()
+            if args.summary.is_absolute()
+            else (repo_root / args.summary).resolve()
+        )
+    elif num_gpus > 1:
+        summary_path = (
+            repo_root / out_rel / f"train_eval_summary.shard{gpu_id}_of_{num_gpus}.csv"
+        ).resolve()
+    else:
+        summary_path = (repo_root / out_rel / "train_eval_summary.csv").resolve()
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     write_header = not summary_path.is_file()
@@ -386,7 +447,12 @@ def main() -> int:
             ])
 
     if failures:
-        fail_log = summary_path.parent / "failures.txt"
+        if num_gpus > 1:
+            fail_log = (
+                summary_path.parent / f"failures.shard{gpu_id}_of_{num_gpus}.txt"
+            )
+        else:
+            fail_log = summary_path.parent / "failures.txt"
         with fail_log.open("w") as f:
             f.write(f"Run: {ts}\n\n")
             for msg in failures:
