@@ -1,0 +1,4 @@
+# ninja log v7
+1	6469	1776404345889803822	/home/stone/dev/projects/articulate/GaussianArt/submodules/simple-knn/build/temp.linux-x86_64-3.10/simple_knn.o	3f4600b0898fbe50
+1	12225	1776404345888776602	/home/stone/dev/projects/articulate/GaussianArt/submodules/simple-knn/build/temp.linux-x86_64-3.10/ext.o	f625ead1a4f0fb66
+2	20730	1776404345890500961	/home/stone/dev/projects/articulate/GaussianArt/submodules/simple-knn/build/temp.linux-x86_64-3.10/spatial.o	cfced33b04571e40
