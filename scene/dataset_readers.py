@@ -83,8 +83,8 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
-    train_cameras_2s: list
-    test_cameras_2s: list
+    train_cameras_2s: list = None
+    test_cameras_2s: list = None
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -818,9 +818,161 @@ def readInfo_2states(path, white_background, eval, extension=".png", no_bg=True)
                            test_cameras_2s=test_cam_infos)
     return scene_info
 
+def readCamerasFromTransformsPNV(path, transformsfile, white_background,
+                                  extension=".png", forced_time=None, no_bg=True):
+    """Camera reader for PartNet-Video (data120) datasets.
+
+    Differences from readCamerasFromTransforms:
+    - Images live in ``rgb/`` (RGBA PNGs, not ``rgba/``)
+    - Depth is a float32 ``.npy`` (already in metres; sentinel ~1e10 → zeroed)
+    - Semantic is an int32 ``.npy`` (values including −1 for unlabelled pixels)
+    - ``forced_time``: override the ``time`` field in each frame (pass 0.0 for
+      the start state and 1.0 for the end state so downstream training code
+      that checks ``camera.time == 0.0 / 1.0`` works correctly)
+    """
+    cam_infos = []
+
+    json_path = os.path.join(path, transformsfile)
+    with open(json_path) as f:
+        contents = json.load(f)
+
+    fovx = contents["camera_angle_x"]
+    fovy = contents.get("camera_angle_y", fovx)
+
+    frames = sorted(contents["frames"], key=lambda x: x["file_path"])
+
+    for idx, frame in enumerate(frames):
+        cam_name = frame["file_path"]                      # e.g. "train/rgb/0000"
+        image_path = os.path.join(path, cam_name + extension)
+        image_name = Path(cam_name).stem
+
+        if not os.path.exists(image_path):
+            print(f"[PNV] image not found, skipping: {image_path}")
+            continue
+
+        try:
+            image = Image.open(image_path)
+            im_data = np.array(image.convert("RGBA"))
+        except Exception as e:
+            print(f"[PNV] damaged image {image_path}: {e}")
+            continue
+
+        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+        norm_data = im_data / 255.0
+        mask = norm_data[..., 3:4]
+        arr = norm_data[:, :, :3]
+        if no_bg:
+            arr = norm_data[:, :, 3:4] * arr + bg * (1 - norm_data[:, :, 3:4])
+            norm_data[:, :, :3] = arr
+        arr_rgba = np.concatenate([arr, mask], axis=-1)
+        image = Image.fromarray(np.array(arr_rgba * 255.0, dtype=np.byte), "RGBA")
+
+        c2w = np.array(frame["transform_matrix"])
+        c2w[:3, 1:3] *= -1          # OpenGL/Blender → COLMAP axes
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3, :3])
+        T = w2c[:3, 3]
+
+        # Depth: replace /rgb/ → /depth/, .png → .npy
+        depth_path = image_path.replace("/rgb/", "/depth/").replace(extension, ".npy")
+        depth = None
+        if os.path.exists(depth_path):
+            depth = np.load(depth_path).astype(np.float32)
+            depth[depth > 100.0] = 0.0   # sentinel value (~1e10) → invalid
+            depth[depth < 0.1]   = 0.0   # below near plane → invalid
+
+        # Semantic: replace /rgb/ → /semantic/, .png → .npy
+        semantic_path = image_path.replace("/rgb/", "/semantic/").replace(extension, ".npy")
+        semantic = None
+        if os.path.exists(semantic_path):
+            semantic = np.load(semantic_path)   # int32; −1 = unlabelled
+
+        frame_time = forced_time if forced_time is not None else frame.get("time", 0.0)
+
+        cam_infos.append(CameraInfo(
+            uid=idx, R=R, T=T, FovY=fovy, FovX=fovx,
+            image=image, depth=depth, mono_depth=None, semantic=semantic,
+            image_path=image_path, image_name=image_name,
+            width=image.size[0], height=image.size[1],
+            fid=frame_time,
+        ))
+
+    return cam_infos
+
+
+def readInfoPartNetVideo(path, white_background, eval, extension=".png"):
+    """Scene-info reader for PartNet-Video (data120) datasets.
+
+    Expected top-level structure::
+
+        <path>/
+            multiview_static_start/   ← start state cameras (forced time=0.0)
+            multiview_static/         ← end   state cameras (forced time=1.0)
+            points3d.ply
+            semantics.npy
+
+    Ground-truth joint info lives at
+    ``<path>/multiview_static/gt/trans.json``; pass that path explicitly to
+    ``eval_axis.py`` via ``--gt_path``.
+    """
+    start_dir = os.path.join(path, "multiview_static_start")
+    end_dir   = os.path.join(path, "multiview_static")
+
+    print("Reading PartNetVideo start cameras (time=0.0)")
+    start_train = readCamerasFromTransformsPNV(
+        start_dir, "transforms_train.json", white_background, extension, forced_time=0.0)
+    try:
+        start_test = readCamerasFromTransformsPNV(
+            start_dir, "transforms_test.json", white_background, extension, forced_time=0.0)
+    except Exception:
+        start_test = []
+
+    print("Reading PartNetVideo end cameras (time=1.0)")
+    end_train = readCamerasFromTransformsPNV(
+        end_dir, "transforms_train.json", white_background, extension, forced_time=1.0)
+    try:
+        end_test = readCamerasFromTransformsPNV(
+            end_dir, "transforms_test.json", white_background, extension, forced_time=1.0)
+    except Exception:
+        end_test = []
+
+    if not eval:
+        start_train = start_train + start_test
+        end_train   = end_train   + end_test
+        start_test  = []
+        end_test    = []
+
+    train_cam_infos = [start_train, end_train]
+    test_cam_infos  = [start_test,  end_test]
+    all_train       = start_train + end_train
+
+    nerf_normalization = getNerfppNorm(all_train)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 100_000
+        print(f"[PNV] Generating random point cloud ({num_pts})…")
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    pcd = fetchPly(ply_path)
+
+    return SceneInfo(
+        point_cloud=pcd,
+        train_cameras=all_train,
+        test_cameras=start_test + end_test,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+        train_cameras_2s=train_cam_infos,
+        test_cameras_2s=test_cam_infos,
+    )
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readInfo_2states,
+    "Blender": readInfo_2states,
+    "PartNetVideo": readInfoPartNetVideo,
     "Multiscan": readMultiscanInfo,
     "Paris": readParisSceneInfo,
     "Scalable": readScalableSceneInfo,

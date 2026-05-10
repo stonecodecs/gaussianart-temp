@@ -1,2 +1,5 @@
 data/
 output/
+# Ignore all files ending with .pyc, at any directory depth:
+*.pyc
+**/*.pyc

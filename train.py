@@ -116,6 +116,7 @@ def training(dataset, opt, pipe, num_parts, testing_iterations, saving_iteration
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
+        # this is [Stage 1] static reconstruction at t=0
         if iteration < mix_iter:
             # while 'start' not in viewpoint_cam.image_name:
             #     if not viewpoint_stack:
@@ -141,10 +142,10 @@ def training(dataset, opt, pipe, num_parts, testing_iterations, saving_iteration
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
         
-        detached_R = art_R.clone().detach()
+        detached_R = art_R.clone().detach()  # previous art_R
         mask_R = torch.zeros_like(art_R).cuda()
 
-        for idx in freeze_parts:
+        for idx in freeze_parts:  # if frozen, then 
             mask_R[idx, :] = 1
         # print("mask_R内容", mask_R)
         
@@ -153,18 +154,18 @@ def training(dataset, opt, pipe, num_parts, testing_iterations, saving_iteration
         
         #import pdb; pdb.set_trace()
 
-        articulation_matrix = build_rotation(art_R_1)
+        articulation_matrix = build_rotation(art_R_1)  # quat2mat
         articulation_trans = art_T
         
-        if iteration > opt.hard_training_step:
+        if iteration > opt.hard_training_step: # set one-hot part vector via argmax (hard step)
             articulation_weights = gaussians.get_weight
-            # 获取每行的最大索引
+            # 获取每行的最大索引 (maximum index per row)
             max_indices = torch.argmax(articulation_weights, dim=1)
             
-            # 创建一个形状为 (N, M) 的全零张量
+            # 创建一个形状为 (N, M) 的全零张量 (zeros-like tensor of N,M)
             new_articulation_weights = torch.zeros_like(articulation_weights)
             
-            # 将最大索引位置的值设为 1
+            # 将最大索引位置的值设为 1 (set max pos index to 1)
             new_articulation_weights[torch.arange(articulation_weights.shape[0]), max_indices] = 1
             articulation_weights = new_articulation_weights
         else:
@@ -191,8 +192,8 @@ def training(dataset, opt, pipe, num_parts, testing_iterations, saving_iteration
             else:
                 semantic = render_pkg["weight"].unsqueeze(0) # [1, S, H, W]
                 semantic_loss = torch.nn.functional.cross_entropy(
-                    input=semantic, 
-                    target=gt_semantic,
+                    input=semantic,      # float32(1,S,H,W)
+                    target=gt_semantic,  # int64(1,H,W)
                     ignore_index=-1, 
                     reduction='mean'
                 )
@@ -265,9 +266,9 @@ def training(dataset, opt, pipe, num_parts, testing_iterations, saving_iteration
             semantic = semantic.squeeze()   
             N, H, W = semantic.shape
             result = torch.zeros((N, H, W), dtype=torch.uint8, device="cuda")
-            max_prob = torch.max(semantic, dim=0).values
+            max_prob = torch.max(semantic, dim=0).values  # class with max prob
             for i in range(N):
-                result[i, :, :] = (semantic[i, :, :] == max_prob)
+                result[i, :, :] = (semantic[i, :, :] == max_prob) # part
             eq = torch.all(result == result[0], dim=0)
             result[:,eq>0]=0
             result = result.unsqueeze(0)
@@ -279,7 +280,8 @@ def training(dataset, opt, pipe, num_parts, testing_iterations, saving_iteration
         else:
             corrloss = None
            
-        if iteration >= 30000 and iteration <= opt.hard_training_step:
+        # if iteration >= 30000 and iteration <= opt.hard_training_step:
+        if iteration >= 100 and iteration <= opt.hard_training_step:
         # if iteration >= 16000 and iteration <= opt.hard_training_step:
             knnloss = knn_loss(gaussians, articulation_weights) # knn loss
             loss += 1. * knnloss
@@ -429,6 +431,9 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--num_parts", type=int, default=2)
     parser.add_argument("--freeze_parts", nargs="+", type=int, default=[])
+    parser.add_argument("--use_partnet_video", action="store_true", default=False,
+                        help="Load dataset in PartNet-Video (data120) format "
+                             "(multiview_static_start + multiview_static, npy depth/semantic)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     

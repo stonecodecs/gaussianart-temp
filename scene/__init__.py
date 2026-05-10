@@ -43,7 +43,11 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        use_pnv = getattr(args, "use_partnet_video", False)
+        if use_pnv or os.path.exists(os.path.join(args.source_path, "multiview_static")):
+            print("Found multiview_static directory – using PartNetVideo reader.")
+            scene_info = sceneLoadTypeCallbacks["PartNetVideo"](args.source_path, args.white_background, args.eval)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

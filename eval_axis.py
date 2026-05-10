@@ -128,10 +128,13 @@ def axis_metrics(motion, gt):
         pos_err = torch.abs(torch.sum(w * cross)) / torch.norm(cross)
     return ang_err, pos_err
 
-def eval_axis(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+def eval_axis(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool,
+              gt_path : str = None):
     source_path = dataset.source_path
-    
-    gt_joints = read_gt(os.path.join(source_path, 'gt', 'trans.json'))
+
+    if gt_path is None:
+        gt_path = os.path.join(source_path, 'gt', 'trans.json')
+    gt_joints = read_gt(gt_path)
 
     model_path = dataset.model_path
     find_latest_iter = 0
@@ -215,10 +218,16 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--gt_path", default=None, type=str,
+        help="Path to gt/trans.json. Defaults to <source_path>/gt/trans.json. "
+             "For PartNet-Video datasets pass e.g. <source>/multiview_static/gt/trans.json",
+    )
     args = get_combined_args(parser)
-    print("Rendering " + args.model_path)
+    print("Evaluating " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    eval_axis(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    eval_axis(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test,
+              gt_path=args.gt_path)
