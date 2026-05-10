@@ -137,7 +137,7 @@ def build_combined_ellipsoid_mesh(
     per_gaussian_rgb: np.ndarray | None = None,
 ) -> o3d.geometry.TriangleMesh:
     n = len(xyz)
-    if n > max_gaussians:
+    if max_gaussians > 0 and n > max_gaussians:
         rng = np.random.default_rng(seed)
         idx = rng.choice(n, max_gaussians, replace=False)
         xyz, scales, rotations = xyz[idx], scales[idx], rotations[idx]
@@ -487,7 +487,12 @@ def main() -> int:
         default=None,
         help="Use point_cloud/iteration_<n>/; default: latest",
     )
-    parser.add_argument("--max_gaussians", type=int, default=1000000) # "no limit"
+    parser.add_argument(
+        "--max_gaussians",
+        type=int,
+        default=1_000_000,
+        help="Cap ellipsoid count (subsample randomly). Use 0 for no cap / all Gaussians.",
+    )
     parser.add_argument("--sphere_resolution", type=int, default=8)
     parser.add_argument("--scale_multiplier", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -577,7 +582,8 @@ def main() -> int:
 
     print(f"Loading {ply_path}")
     xyz, scales, rotations = load_gaussians(str(ply_path))
-    print(f"  {len(xyz)} Gaussians in file; visualizing up to {args.max_gaussians}")
+    cap_msg = "all" if args.max_gaussians <= 0 else str(args.max_gaussians)
+    print(f"  {len(xyz)} Gaussians in file; visualizing up to {cap_msg}")
 
     per_rgb = None
     if args.use_gaussian_color:

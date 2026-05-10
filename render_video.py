@@ -8,6 +8,7 @@ from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
 from utils.general_utils import safe_state, build_rotation, vis_depth
+from utils.system_utils import searchForMaxIteration
 import torchvision
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, OptimizationParams
@@ -71,10 +72,10 @@ def generate_camera_poses(N=30):
     radius, r_theta, r_phi = traj_info['radius'], traj_info['theta'], traj_info['phi']
     d_theta, d_phi = traj_info['d_theta'], traj_info['d_phi']
 
-    thetas = np.linspace(r_theta[0] * np.pi, r_theta[1] * np.pi, N)
-    thetas = np.concatenate([np.zeros(N//2), thetas]) + d_theta * np.pi
-    azimuths = np.linspace(r_phi[0] * np.pi, r_phi[1] * np.pi, N)
-    azimuths = np.concatenate([np.zeros(N//2), azimuths]) + d_phi * np.pi
+    # Smooth orbit over exactly N poses (legacy code prepended N//2 duplicate
+    # samples, which froze the camera for the opening third of the video).
+    thetas = np.linspace(r_theta[0] * np.pi, r_theta[1] * np.pi, N) + d_theta * np.pi
+    azimuths = np.linspace(r_phi[0] * np.pi, r_phi[1] * np.pi, N) + d_phi * np.pi
     roty180 = np.array([[-1, 0, 0, 0],
                         [0, 1, 0, 0],
                         [0, 0, -1, 0],
@@ -270,12 +271,17 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
-    
-    with open(os.path.join(args.model_path, 'results.txt'), 'r') as f:
-        iter_line = f.readline()
-        iteration = int(iter_line.split(':')[-1])
-        
-    args.iteration = iteration
+
+    results_path = os.path.join(args.model_path, "results.txt")
+    if os.path.isfile(results_path):
+        # Written by eval_axis.py: first line is "The best: <iter>"
+        with open(results_path, "r") as f:
+            iter_line = f.readline()
+        args.iteration = int(iter_line.split(":")[-1].strip())
+    elif args.iteration < 0:
+        pc_root = os.path.join(args.model_path, "point_cloud")
+        args.iteration = searchForMaxIteration(pc_root)
+        print(f"No results.txt; using latest point_cloud iteration {args.iteration}")
 
     render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.N_frames)
         

@@ -17,6 +17,7 @@ Outputs per scene::
         ckpts/ours_*.pth           ← articulation checkpoints (from train.py)
         point_cloud/               ← Gaussian splats
         results.txt                ← eval_axis metrics + Gaussian count
+        gaussian_structure_orbit.mp4  ← ellipsoid orbit (Open3D, DC colors, all Gaussians)
         error.txt                  ← only written when a stage fails
 
 A CSV summary is appended to ``<output_dir>/train_eval_summary.csv``.
@@ -141,6 +142,11 @@ def main() -> int:
     parser.add_argument("--skip-eval",   action="store_true", help="Skip evaluation")
     parser.add_argument("--skip-render", action="store_true", help="Skip render_video step")
     parser.add_argument(
+        "--skip-structure-video",
+        action="store_true",
+        help="Skip scripts/vis_gaussian_structure.py orbital ellipsoid MP4",
+    )
+    parser.add_argument(
         "--summary",
         type=Path,
         default=None,
@@ -203,6 +209,7 @@ def main() -> int:
         train_ok  = True
         eval_ok   = True
         render_ok = True
+        structure_ok = True
         gaussian_count: int | None = None
 
         # ------------------------------------------------------------------
@@ -227,7 +234,7 @@ def main() -> int:
                 "--eval",
                 "--num_parts", str(num_parts),
                 "--use_partnet_video",
-                "--freeze_parts",
+                "--freeze_parts"
             ] + [str(i) for i in freeze_parts]
 
             print(f"[TRAIN] {' '.join(cmd)}")
@@ -245,30 +252,7 @@ def main() -> int:
                     gaussian_count = _count_gaussians(ply)
 
         # ------------------------------------------------------------------
-        # 2. RENDER
-        # ------------------------------------------------------------------
-        if not args.skip_render and train_ok:
-            render_script = repo_root / "render_video.py"
-            if render_script.is_file():
-                cmd = [
-                    sys.executable, str(render_script),
-                    "-m", str(model_path),
-                ]
-                print(f"[RENDER] {' '.join(cmd)}")
-                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
-                if r.returncode != 0:
-                    render_ok = False
-                    msg = f"{name}: render_video.py exit {r.returncode}"
-                    print(msg, file=sys.stderr)
-                    _write_error(model_path, name, "render",
-                                 f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}")
-                    failures.append(msg)
-            else:
-                print(f"[RENDER] render_video.py not found, skipping.")
-                render_ok = False
-
-        # ------------------------------------------------------------------
-        # 3. EVAL
+        # 2. EVAL (before render: render_video.py reads results.txt for iteration)
         # ------------------------------------------------------------------
         if not args.skip_eval and train_ok:
             if not (model_path / "cfg_args").is_file():
@@ -294,7 +278,73 @@ def main() -> int:
                     failures.append(msg)
 
         # ------------------------------------------------------------------
-        # 4. Record Gaussian count into results.txt
+        # 3. RENDER
+        # ------------------------------------------------------------------
+        if not args.skip_render and train_ok:
+            render_script = repo_root / "render_video.py"
+            if render_script.is_file():
+                cmd = [
+                    sys.executable, str(render_script),
+                    "-m", str(model_path),
+                ]
+                print(f"[RENDER] {' '.join(cmd)}")
+                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                if r.returncode != 0:
+                    render_ok = False
+                    msg = f"{name}: render_video.py exit {r.returncode}"
+                    print(msg, file=sys.stderr)
+                    _write_error(model_path, name, "render",
+                                 f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}")
+                    failures.append(msg)
+            else:
+                print(f"[RENDER] render_video.py not found, skipping.")
+                render_ok = False
+
+        # ------------------------------------------------------------------
+        # 4. Ellipsoid structure video (orbit, Gaussian DC colors, no subsample)
+        # ------------------------------------------------------------------
+        if (
+            not args.skip_structure_video
+            and train_ok
+            and (model_path / "cameras.json").is_file()
+        ):
+            vis_script = repo_root / "scripts" / "vis_gaussian_structure.py"
+            if vis_script.is_file():
+                cmd = [
+                    sys.executable,
+                    str(vis_script),
+                    "-m",
+                    str(model_path),
+                    "--video",
+                    "--trajectory",
+                    "orbit",
+                    "--use_gaussian_color",
+                    "--max_gaussians",
+                    "0",
+                    "--out",
+                    "gaussian_structure_orbit.mp4",
+                ]
+                print(f"[STRUCTURE] {' '.join(cmd)}")
+                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                if r.returncode != 0:
+                    structure_ok = False
+                    msg = f"{name}: vis_gaussian_structure.py exit {r.returncode}"
+                    print(msg, file=sys.stderr)
+                    _write_error(
+                        model_path,
+                        name,
+                        "structure_video",
+                        f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}",
+                    )
+                    failures.append(msg)
+            else:
+                structure_ok = False
+                msg = f"{name}: vis_gaussian_structure.py not found"
+                print(f"[STRUCTURE] {msg}", file=sys.stderr)
+                failures.append(msg)
+
+        # ------------------------------------------------------------------
+        # 5. Record Gaussian count into results.txt
         # ------------------------------------------------------------------
         ply = _latest_ply(model_path)
         if ply is not None:
@@ -309,7 +359,7 @@ def main() -> int:
                 print(f"[INFO] Gaussian primitives: {gaussian_count}")
 
         # ------------------------------------------------------------------
-        # 5. CSV summary row
+        # 6. CSV summary row
         # ------------------------------------------------------------------
         results_rel = (
             os.path.relpath(model_path / "results.txt", repo_root)
@@ -321,7 +371,7 @@ def main() -> int:
             if write_header:
                 w.writerow([
                     "timestamp_utc", "scene",
-                    "train_ok", "render_ok", "eval_ok",
+                    "train_ok", "render_ok", "eval_ok", "structure_ok",
                     "gaussian_count", "results_txt",
                 ])
                 write_header = False
@@ -330,6 +380,7 @@ def main() -> int:
                 str(train_ok  if not args.skip_train  else "skipped"),
                 str(render_ok if not args.skip_render else "skipped"),
                 str(eval_ok   if not args.skip_eval   else "skipped"),
+                str(structure_ok if not args.skip_structure_video else "skipped"),
                 str(gaussian_count) if gaussian_count is not None else "",
                 results_rel,
             ])
