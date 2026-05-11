@@ -142,9 +142,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--output-dir",
-        type=str,
-        default="output/PartNetVideo",
-        help="Training output directory (relative to repo root)",
+        type=Path,
+        default=Path("output/PartNetVideo"),
+        help="Training output directory (absolute, or relative to repo root)",
     )
     parser.add_argument(
         "--gpu",
@@ -237,7 +237,11 @@ def main() -> int:
             )
             return 0
 
-    out_rel = args.output_dir.strip("/")
+    output_root = (
+        args.output_dir.resolve()
+        if args.output_dir.is_absolute()
+        else (repo_root / args.output_dir).resolve()
+    )
     if args.summary is not None:
         summary_path = (
             args.summary.resolve()
@@ -246,10 +250,10 @@ def main() -> int:
         )
     elif num_gpus > 1:
         summary_path = (
-            repo_root / out_rel / f"train_eval_summary.shard{gpu_id}_of_{num_gpus}.csv"
-        ).resolve()
+            output_root / f"train_eval_summary.shard{gpu_id}_of_{num_gpus}.csv"
+        )
     else:
-        summary_path = (repo_root / out_rel / "train_eval_summary.csv").resolve()
+        summary_path = output_root / "train_eval_summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     write_header = not summary_path.is_file()
@@ -261,7 +265,7 @@ def main() -> int:
 
     for name in scenes:
         scene_dir  = data_root / name
-        model_path = repo_root / out_rel / name
+        model_path = output_root / name
         gt_trans   = _gt_trans_path(scene_dir)
 
         print(f"\n{'='*60}")
@@ -424,11 +428,14 @@ def main() -> int:
         # ------------------------------------------------------------------
         # 6. CSV summary row
         # ------------------------------------------------------------------
-        results_rel = (
-            os.path.relpath(model_path / "results.txt", repo_root)
-            if (model_path / "results.txt").is_file()
-            else ""
-        )
+        results_txt = model_path / "results.txt"
+        if results_txt.is_file():
+            try:
+                results_rel = str(results_txt.relative_to(repo_root))
+            except ValueError:
+                results_rel = str(results_txt)
+        else:
+            results_rel = ""
         with summary_path.open("a", newline="") as f:
             w = csv.writer(f)
             if write_header:
