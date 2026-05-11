@@ -911,9 +911,9 @@ def readInfoPartNetVideo(path, white_background, eval, extension=".png"):
             points3d.ply
             semantics.npy
 
-    Ground-truth joint info lives at
-    ``<path>/multiview_static/gt/trans.json``; pass that path explicitly to
-    ``eval_axis.py`` via ``--gt_path``.
+    Ground-truth joint axes for eval typically live at
+    ``<path>/singleview_dynamic/gt/trans.json``; ``train_eval_all_pnv.py`` passes that
+    path to ``eval_axis.py`` via ``--gt_path``.
     """
     start_dir = os.path.join(path, "multiview_static_start")
     end_dir   = os.path.join(path, "multiview_static")

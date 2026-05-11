@@ -221,7 +221,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gt_path", default=None, type=str,
         help="Path to gt/trans.json. Defaults to <source_path>/gt/trans.json. "
-             "For PartNet-Video datasets pass e.g. <source>/multiview_static/gt/trans.json",
+             "For PartNet-Video datasets pass e.g. <source>/singleview_dynamic/gt/trans.json",
     )
     args = get_combined_args(parser)
     print("Evaluating " + args.model_path)

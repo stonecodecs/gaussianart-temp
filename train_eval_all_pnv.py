@@ -7,7 +7,7 @@ Dataset layout expected per scene::
     <data_root>/<scene_name>/
         multiview_static_start/   ← start-state cameras
         multiview_static/         ← end-state cameras
-        multiview_static/gt/trans.json   ← joint ground-truth
+        singleview_dynamic/gt/trans.json   ← joint ground-truth (motion axes)
         points3d.ply
         semantics.npy
 
@@ -62,7 +62,7 @@ from pathlib import Path
 
 def _gt_trans_path(scene_dir: Path) -> Path | None:
     """Return the trans.json path for a PartNet-Video scene, or None."""
-    candidate = scene_dir / "multiview_static" / "gt" / "trans.json"
+    candidate = scene_dir / "singleview_dynamic" / "gt" / "trans.json"
     return candidate if candidate.is_file() else None
 
 
@@ -172,6 +172,7 @@ def main() -> int:
         default=None,
         help="Only process these scene names (default: all valid scenes)",
     )
+    parser.add_argument("--iterations", type=int, default=100_000, help="Number of iterations to train")
     parser.add_argument("--skip-train",  action="store_true", help="Skip training")
     parser.add_argument("--skip-eval",   action="store_true", help="Skip evaluation")
     parser.add_argument("--skip-render", action="store_true", help="Skip render_video step")
@@ -201,7 +202,7 @@ def main() -> int:
         missing = want - set(scenes)
         for m in sorted(missing):
             print(
-                f"Warning: '{m}' not found or missing multiview_static/gt/trans.json",
+                f"Warning: '{m}' not found or missing singleview_dynamic/gt/trans.json",
                 file=sys.stderr,
             )
 
@@ -295,6 +296,7 @@ def main() -> int:
                 "--eval",
                 "--num_parts", str(num_parts),
                 "--use_partnet_video",
+                "--iterations", str(args.iterations),
                 "--freeze_parts"
             ] + [str(i) for i in freeze_parts]
 
