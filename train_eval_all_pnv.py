@@ -186,7 +186,13 @@ def main() -> int:
         help="Re-process scenes even when the final checkpoint (ours_<iterations>.pth) already exists",
     )
     parser.add_argument("--skip-train",  action="store_true", help="Skip training")
-    parser.add_argument("--skip-eval",   action="store_true", help="Skip evaluation")
+    parser.add_argument("--skip-eval",   action="store_true", help="Skip axis evaluation")
+    parser.add_argument(
+        "--skip-image-metrics",
+        action="store_true",
+        dest="skip_image_metrics",
+        help="Skip eval_image_metrics.py (PSNR/SSIM/LPIPS on the test set)",
+    )
     parser.add_argument("--skip-render", action="store_true", help="Skip render_video step")
     parser.add_argument(
         "--skip-structure-video",
@@ -389,6 +395,44 @@ def main() -> int:
                     failures.append(msg)
 
         # ------------------------------------------------------------------
+        # 2b. IMAGE METRICS (PSNR / SSIM / LPIPS on the test set)
+        #     Only runs if training succeeded (or was skipped) and cfg_args exists.
+        # ------------------------------------------------------------------
+        image_metrics_ok = True
+        if not args.skip_image_metrics and train_ok:
+            metrics_script = repo_root / "eval_image_metrics.py"
+            if not metrics_script.is_file():
+                image_metrics_ok = False
+                print(f"[METRICS] eval_image_metrics.py not found, skipping.")
+            elif not (model_path / "cfg_args").is_file():
+                image_metrics_ok = False
+                msg = f"{name}: missing cfg_args, cannot run eval_image_metrics.py"
+                print(msg, file=sys.stderr)
+                _write_error(model_path, name, "image_metrics", msg)
+                failures.append(msg)
+            else:
+                cmd = [
+                    sys.executable, str(metrics_script),
+                    "-m", str(model_path),
+                ]
+                print(f"[METRICS] {' '.join(cmd)}")
+                try:
+                    r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                    rc = r.returncode
+                except Exception as exc:
+                    rc = -1
+                    print(f"[METRICS] subprocess raised: {exc}", file=sys.stderr)
+                    _write_error(model_path, name, "image_metrics",
+                                 traceback.format_exc())
+                if rc != 0:
+                    image_metrics_ok = False
+                    msg = f"{name}: eval_image_metrics.py exit {rc}"
+                    print(msg, file=sys.stderr)
+                    _write_error(model_path, name, "image_metrics",
+                                 f"Exit code: {rc}\nCmd: {' '.join(cmd)}")
+                    failures.append(msg)
+
+        # ------------------------------------------------------------------
         # 3. RENDER (only runs if training succeeded or was skipped)
         # ------------------------------------------------------------------
         if not args.skip_render and train_ok:
@@ -500,7 +544,8 @@ def main() -> int:
             if write_header:
                 w.writerow([
                     "timestamp_utc", "scene",
-                    "train_ok", "render_ok", "eval_ok", "structure_ok",
+                    "train_ok", "render_ok", "eval_ok",
+                    "image_metrics_ok", "structure_ok",
                     "gaussian_count", "results_txt",
                 ])
                 write_header = False
@@ -509,6 +554,7 @@ def main() -> int:
                 str(train_ok  if not args.skip_train  else "skipped"),
                 str(render_ok if not args.skip_render else "skipped"),
                 str(eval_ok   if not args.skip_eval   else "skipped"),
+                str(image_metrics_ok if not args.skip_image_metrics else "skipped"),
                 str(structure_ok if not args.skip_structure_video else "skipped"),
                 str(gaussian_count) if gaussian_count is not None else "",
                 results_rel,
