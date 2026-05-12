@@ -173,6 +173,18 @@ def main() -> int:
         help="Only process these scene names (default: all valid scenes)",
     )
     parser.add_argument("--iterations", type=int, default=100_000, help="Number of iterations to train")
+    parser.add_argument(
+        "--max-parts",
+        type=int,
+        default=21,
+        dest="max_parts",
+        help="Skip scenes whose trans.json yields more than this many parts (movable + 1 static)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-process scenes even when the final checkpoint (ours_<iterations>.pth) already exists",
+    )
     parser.add_argument("--skip-train",  action="store_true", help="Skip training")
     parser.add_argument("--skip-eval",   action="store_true", help="Skip evaluation")
     parser.add_argument("--skip-render", action="store_true", help="Skip render_video step")
@@ -272,6 +284,35 @@ def main() -> int:
         print(f"  {name}")
         print(f"{'='*60}")
 
+        # Parse trans.json once: needed both for the part-count cap and for training.
+        try:
+            num_parts, freeze_parts = _num_parts_from_trans(gt_trans)
+        except Exception as exc:
+            msg = f"{name}: could not parse trans.json: {exc}"
+            print(msg, file=sys.stderr)
+            _write_error(model_path, name, "parse_trans",
+                         traceback.format_exc())
+            failures.append(msg)
+            continue
+
+        # Skip scenes that exceed the part-count cap.
+        if num_parts > args.max_parts:
+            print(
+                f"[SKIP] {name}: num_parts={num_parts} > --max-parts={args.max_parts}",
+                flush=True,
+            )
+            continue
+
+        # Skip already-finished runs unless --force.
+        final_ckpt = model_path / "ckpts" / f"ours_{args.iterations}.pth"
+        if final_ckpt.is_file() and not args.force:
+            print(
+                f"[SKIP] {name}: {final_ckpt.name} already exists "
+                f"(use --force to re-run)",
+                flush=True,
+            )
+            continue
+
         train_ok  = True
         eval_ok   = True
         render_ok = True
@@ -282,16 +323,6 @@ def main() -> int:
         # 1. TRAIN
         # ------------------------------------------------------------------
         if not args.skip_train:
-            try:
-                num_parts, freeze_parts = _num_parts_from_trans(gt_trans)
-            except Exception as exc:
-                msg = f"{name}: could not parse trans.json: {exc}"
-                print(msg, file=sys.stderr)
-                _write_error(model_path, name, "parse_trans",
-                             traceback.format_exc())
-                failures.append(msg)
-                continue
-
             cmd = [
                 sys.executable, str(repo_root / "train.py"),
                 "-s", str(scene_dir),
@@ -305,13 +336,19 @@ def main() -> int:
             ] + [str(i) for i in freeze_parts]
 
             print(f"[TRAIN] {' '.join(cmd)}")
-            r = subprocess.run(cmd, cwd=str(repo_root), env=env)
-            if r.returncode != 0:
+            try:
+                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                rc = r.returncode
+            except Exception as exc:
+                rc = -1
+                print(f"[TRAIN] subprocess raised: {exc}", file=sys.stderr)
+                _write_error(model_path, name, "train", traceback.format_exc())
+            if rc != 0:
                 train_ok = False
-                msg = f"{name}: train.py exit {r.returncode}"
+                msg = f"{name}: train.py exit {rc}"
                 print(msg, file=sys.stderr)
                 _write_error(model_path, name, "train",
-                             f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}")
+                             f"Exit code: {rc}\nCmd: {' '.join(cmd)}")
                 failures.append(msg)
                 # record Gaussian count even on partial runs
                 ply = _latest_ply(model_path)
@@ -320,6 +357,7 @@ def main() -> int:
 
         # ------------------------------------------------------------------
         # 2. EVAL (before render: render_video.py reads results.txt for iteration)
+        #    Only runs if training succeeded (or was skipped).
         # ------------------------------------------------------------------
         if not args.skip_eval and train_ok:
             if not (model_path / "cfg_args").is_file():
@@ -335,40 +373,53 @@ def main() -> int:
                     "--gt_path", str(gt_trans),
                 ]
                 print(f"[EVAL] {' '.join(cmd)}")
-                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
-                if r.returncode != 0:
+                try:
+                    r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                    rc = r.returncode
+                except Exception as exc:
+                    rc = -1
+                    print(f"[EVAL] subprocess raised: {exc}", file=sys.stderr)
+                    _write_error(model_path, name, "eval", traceback.format_exc())
+                if rc != 0:
                     eval_ok = False
-                    msg = f"{name}: eval_axis.py exit {r.returncode}"
+                    msg = f"{name}: eval_axis.py exit {rc}"
                     print(msg, file=sys.stderr)
                     _write_error(model_path, name, "eval",
-                                 f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}")
+                                 f"Exit code: {rc}\nCmd: {' '.join(cmd)}")
                     failures.append(msg)
 
         # ------------------------------------------------------------------
-        # 3. RENDER
+        # 3. RENDER (only runs if training succeeded or was skipped)
         # ------------------------------------------------------------------
         if not args.skip_render and train_ok:
             render_script = repo_root / "render_video.py"
-            if render_script.is_file():
+            if not render_script.is_file():
+                render_ok = False
+                print(f"[RENDER] render_video.py not found, skipping.")
+            else:
                 cmd = [
                     sys.executable, str(render_script),
                     "-m", str(model_path),
                 ]
                 print(f"[RENDER] {' '.join(cmd)}")
-                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
-                if r.returncode != 0:
+                try:
+                    r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                    rc = r.returncode
+                except Exception as exc:
+                    rc = -1
+                    print(f"[RENDER] subprocess raised: {exc}", file=sys.stderr)
+                    _write_error(model_path, name, "render", traceback.format_exc())
+                if rc != 0:
                     render_ok = False
-                    msg = f"{name}: render_video.py exit {r.returncode}"
+                    msg = f"{name}: render_video.py exit {rc}"
                     print(msg, file=sys.stderr)
                     _write_error(model_path, name, "render",
-                                 f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}")
+                                 f"Exit code: {rc}\nCmd: {' '.join(cmd)}")
                     failures.append(msg)
-            else:
-                print(f"[RENDER] render_video.py not found, skipping.")
-                render_ok = False
 
         # ------------------------------------------------------------------
         # 4. Ellipsoid structure video (orbit, Gaussian DC colors, no subsample)
+        #    Only runs if training succeeded (or was skipped) and cameras.json exists.
         # ------------------------------------------------------------------
         if (
             not args.skip_structure_video
@@ -392,16 +443,24 @@ def main() -> int:
                     "gaussian_structure_orbit.mp4",
                 ]
                 print(f"[STRUCTURE] {' '.join(cmd)}")
-                r = subprocess.run(cmd, cwd=str(repo_root), env=env)
-                if r.returncode != 0:
+                try:
+                    r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                    rc = r.returncode
+                except Exception as exc:
+                    rc = -1
+                    print(f"[STRUCTURE] subprocess raised: {exc}", file=sys.stderr)
+                    _write_error(
+                        model_path, name, "structure_video", traceback.format_exc()
+                    )
+                if rc != 0:
                     structure_ok = False
-                    msg = f"{name}: vis_gaussian_structure.py exit {r.returncode}"
+                    msg = f"{name}: vis_gaussian_structure.py exit {rc}"
                     print(msg, file=sys.stderr)
                     _write_error(
                         model_path,
                         name,
                         "structure_video",
-                        f"Exit code: {r.returncode}\nCmd: {' '.join(cmd)}",
+                        f"Exit code: {rc}\nCmd: {' '.join(cmd)}",
                     )
                     failures.append(msg)
             else:
