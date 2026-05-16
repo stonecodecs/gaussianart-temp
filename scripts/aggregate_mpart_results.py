@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Aggregate eval metrics from GaussianArt/MPArt `results.txt` files under an output tree.
+Aggregate eval metrics from GaussianArt/MPArt ``results.json`` files under an output tree.
 
-Valid files match eval_axis.py output: Evaluated iteration (or legacy The best), Parts num,
-Angle mean, Distance mean, Theta diff mean, and optional Part N: lines. Skips dirs where
-results.txt is missing or incomplete.
+Reads the ``axis_eval`` block written by ``eval_axis.py``. Skips dirs where
+results.json is missing or incomplete.
 
 Usage:
   python scripts/aggregate_mpart_results.py --root output/MPArt90
@@ -15,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -32,55 +30,42 @@ class SceneResult:
     part_rows: list[tuple[float, float, float]] = field(default_factory=list)
 
 
-PART_LINE = re.compile(
-    r"^Part\s+(\d+):\s*angle=([\d.eE+-]+),\s*distance=([\d.eE+-]+),\s*theta_diff=([\d.eE+-]+)\s*$"
-)
-
-
-def parse_results_txt(path: Path) -> SceneResult | None:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
+def parse_results_json(path: Path) -> SceneResult | None:
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
         return None
 
-    parts_num: int | None = None
-    angle_mean = distance_mean = theta_diff_mean = None
+    ae = data.get("axis_eval")
+    if not isinstance(ae, dict):
+        return None
+
+    try:
+        parts_num = int(ae["parts_num"])
+        angle_mean = float(ae.get("angle_mean_deg", ae.get("angle_mean")))
+        distance_mean = float(ae["distance_mean"])
+        theta_diff_mean = float(ae["theta_diff_mean"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
     part_rows: list[tuple[float, float, float]] = []
+    per_part = ae.get("per_part")
+    if isinstance(per_part, list):
+        for row in per_part:
+            if not isinstance(row, dict):
+                continue
+            try:
+                part_rows.append((
+                    float(row.get("angle_deg", row.get("angle"))),
+                    float(row["distance"]),
+                    float(row["theta_diff"]),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
 
-    for ln in lines:
-        if ln.startswith("Parts num:"):
-            try:
-                parts_num = int(ln.split(":", 1)[1].strip())
-            except ValueError:
-                return None
-        elif ln.startswith("Angle mean:"):
-            try:
-                angle_mean = float(ln.split(":", 1)[1].strip())
-            except ValueError:
-                return None
-        elif ln.startswith("Distance mean:"):
-            try:
-                distance_mean = float(ln.split(":", 1)[1].strip())
-            except ValueError:
-                return None
-        elif ln.startswith("Theta diff mean:"):
-            try:
-                theta_diff_mean = float(ln.split(":", 1)[1].strip())
-            except ValueError:
-                return None
-        else:
-            m = PART_LINE.match(ln)
-            if m:
-                part_rows.append(
-                    (float(m.group(2)), float(m.group(3)), float(m.group(4)))
-                )
-
-    if parts_num is None or angle_mean is None or distance_mean is None or theta_diff_mean is None:
-        return None
-
-    name = path.parent.name
     return SceneResult(
-        name=name,
+        name=path.parent.name,
         parts_num=parts_num,
         angle_mean=angle_mean,
         distance_mean=distance_mean,
@@ -98,12 +83,14 @@ def mean_std(xs: list[float]) -> tuple[float, float]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aggregate results.txt metrics under a root folder")
+    parser = argparse.ArgumentParser(
+        description="Aggregate results.json axis_eval metrics under a root folder"
+    )
     parser.add_argument(
         "--root",
         type=Path,
         default=Path("output/MPArt90"),
-        help="Directory containing per-scene subfolders with results.txt",
+        help="Directory containing per-scene subfolders with results.json",
     )
     parser.add_argument(
         "--json",
@@ -118,20 +105,20 @@ def main() -> None:
         print(f"Not a directory: {root}", file=sys.stderr)
         sys.exit(1)
 
-    all_paths = sorted(root.glob("**/results.txt"))
+    all_paths = sorted(root.glob("**/results.json"))
     parsed: list[SceneResult] = []
     skipped: list[tuple[Path, str]] = []
 
     for p in all_paths:
-        r = parse_results_txt(p)
+        r = parse_results_json(p)
         if r is None:
-            skipped.append((p, "parse failed or incomplete"))
+            skipped.append((p, "parse failed or missing axis_eval"))
             continue
         parsed.append(r)
 
     n = len(parsed)
     if n == 0:
-        print(f"No valid results.txt under {root}")
+        print(f"No valid results.json under {root}")
         sys.exit(0)
 
     # --- Global averages (scene-level means) ---
@@ -153,7 +140,6 @@ def main() -> None:
         sa = [x.angle_mean for x in subs]
         sd = [x.distance_mean for x in subs]
         st = [x.theta_diff_mean for x in subs]
-        # Pooled per-part metrics (all Part lines from scenes with this part count)
         pooled_a: list[float] = []
         pooled_d: list[float] = []
         pooled_t: list[float] = []
@@ -212,9 +198,8 @@ def main() -> None:
         ],
     }
 
-    # --- Human-readable report ---
     print(f"Root: {root}")
-    print(f"Valid results.txt: {n}  |  Skipped (invalid/incomplete): {len(skipped)}")
+    print(f"Valid results.json: {n}  |  Skipped (invalid/incomplete): {len(skipped)}")
     print()
     print("Global average (mean of each scene’s Angle mean / Distance mean / Theta diff mean):")
     print(f"  angle_mean:        {g_am:.6f}  (stdev across scenes: {g_am_sd:.6f})")
@@ -249,7 +234,6 @@ def main() -> None:
         print(f"Skipped {len(skipped)} files (omit listing; use --json for full list)")
 
     if args.json:
-        # include skipped paths in json for debugging
         out["skipped"] = [str(p.relative_to(root)) for p, _ in skipped]
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(out, indent=2), encoding="utf-8")

@@ -5,7 +5,7 @@ from scipy.spatial.transform import Rotation as R
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from scipy.spatial.transform import Rotation
-from utils.system_utils import mkdir_p
+from utils.results_json import save_results_json_merged
 from utils.rotation_utils import *
 import glob
 import cv2
@@ -79,7 +79,7 @@ def interpret_transforms(base_R, base_t, R, t, joint_type='revolute'):
 
     return joint_info, R, t
 
-def read_gt(gt_path):
+def read_gt(gt_path, legacy=False):
     with open(gt_path, 'r') as f:
         info = json.load(f)
 
@@ -90,7 +90,11 @@ def read_gt(gt_path):
     for trans_info in all_trans_info:
         axis = trans_info['axis']
         axis_o, axis_d = np.array(axis['o']), np.array(axis['d'])
-        R_coord = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]).T
+        if legacy:  # MPArt90
+            R_coord = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]).T
+        else: # new dataset
+            R_coord = np.eye(3)
+
         axis_o = np.matmul(R_coord, axis_o)
         axis_d = np.matmul(R_coord, axis_d)
         axis_type = trans_info['type']
@@ -129,12 +133,12 @@ def axis_metrics(motion, gt):
     return ang_err, pos_err
 
 def eval_axis(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool,
-              gt_path : str = None):
+              gt_path : str = None, legacy=True):
     source_path = dataset.source_path
 
     if gt_path is None:
         gt_path = os.path.join(source_path, 'gt', 'trans.json')
-    gt_joints = read_gt(gt_path)
+    gt_joints = read_gt(gt_path, legacy=legacy)
 
     model_path = dataset.model_path
     find_latest_iter = 0
@@ -194,20 +198,24 @@ def eval_axis(dataset : ModelParams, iteration : int, pipeline : PipelineParams,
     print("Distance mean:", b)
     print("Theta diff mean:", c)
     
-    file = os.path.join(model_path, 'results.txt')
-    mkdir_p(os.path.dirname(file))
-    with open(file, 'w') as f:
-        f.write(f"The best: {it}\n")
-        f.write(f"Parts num: {N}\n")
-        f.write(f"Angle mean: {a}\n")
-        f.write(f"Distance mean: {b}\n")
-        f.write(f"Theta diff mean: {c}\n")
-        
-        for idx, (angle, distance, theta_diff) in enumerate(best_parts_results):
-            f.write(f"Part {idx}: angle={angle:.4f}, distance={distance:.4f}, theta_diff={theta_diff:.4f}\n")
-        #f.write(f"test")
-        
-        
+    axis_eval = {
+        "best_iteration": int(it),
+        "parts_num": int(N),
+        "angle_mean_deg": float(a),
+        "distance_mean": float(b),
+        "theta_diff_mean": float(c),
+        "legacy_coord": bool(legacy),
+        "per_part": [
+            {
+                "part_index": idx,
+                "angle_deg": float(angle),
+                "distance": float(distance),
+                "theta_diff": float(theta_diff),
+            }
+            for idx, (angle, distance, theta_diff) in enumerate(best_parts_results)
+        ],
+    }
+    save_results_json_merged(model_path, {"axis_eval": axis_eval})
     
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -223,6 +231,8 @@ if __name__ == "__main__":
         help="Path to gt/trans.json. Defaults to <source_path>/gt/trans.json. "
              "For PartNet-Video datasets pass e.g. <source>/singleview_dynamic/gt/trans.json",
     )
+    parser.add_argument("--legacy", action="store_true", default=False,
+                        help="Use the legacy coordinate system")
     args = get_combined_args(parser)
     print("Evaluating " + args.model_path)
 
@@ -230,4 +240,4 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     eval_axis(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test,
-              gt_path=args.gt_path)
+              gt_path=args.gt_path, legacy=args.legacy)

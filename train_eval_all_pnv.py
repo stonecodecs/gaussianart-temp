@@ -16,7 +16,7 @@ Outputs per scene::
     <output_dir>/<scene_name>/
         ckpts/ours_*.pth           ← articulation checkpoints (from train.py)
         point_cloud/               ← Gaussian splats
-        results.txt                ← eval_axis metrics + Gaussian count
+        results.json               ← merged metrics (axis_eval, image_metrics, point_cloud_stats)
         gaussian_structure_orbit.mp4  ← ellipsoid orbit (Open3D, DC colors, all Gaussians)
         error.txt                  ← only written when a stage fails
 
@@ -26,6 +26,8 @@ Example::
 
     python train_eval_all_pnv.py --data-dir data120 --gpu 0
     python train_eval_all_pnv.py --data-dir data120 --models Safe_101605 --skip-train
+    python train_eval_all_pnv.py --data-dir data120 --reeval-completed
+        # scenes with ours_<iterations>.pth: skip train, re-run eval/render/metrics
 
 Multi-GPU / Kubernetes: run one process per worker with the same ``--num-gpus`` and a
 distinct ``--gpu-id``. Scenes (sorted) are split by striding: worker *k* gets
@@ -55,8 +57,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-
-# ---------------------------------------------------------------------------
+from utils.results_json import results_json_path, save_results_json_merged
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -185,6 +186,13 @@ def main() -> int:
         action="store_true",
         help="Re-process scenes even when the final checkpoint (ours_<iterations>.pth) already exists",
     )
+    parser.add_argument(
+        "--reeval-completed",
+        action="store_true",
+        dest="reeval_completed",
+        help="If ours_<iterations>.pth exists, skip training but still run eval, "
+             "image metrics, render, and structure video (default: skip the whole scene)",
+    )
     parser.add_argument("--skip-train",  action="store_true", help="Skip training")
     parser.add_argument("--skip-eval",   action="store_true", help="Skip axis evaluation")
     parser.add_argument(
@@ -309,15 +317,27 @@ def main() -> int:
             )
             continue
 
-        # Skip already-finished runs unless --force.
+        # Completed scenes: skip entirely, re-eval only, or retrain (--force).
         final_ckpt = model_path / "ckpts" / f"ours_{args.iterations}.pth"
-        if final_ckpt.is_file() and not args.force:
+        training_complete = final_ckpt.is_file()
+
+        if training_complete and not args.force and not args.reeval_completed:
             print(
                 f"[SKIP] {name}: {final_ckpt.name} already exists "
-                f"(use --force to re-run)",
+                f"(use --reeval-completed to re-run eval, or --force to retrain)",
                 flush=True,
             )
             continue
+
+        skip_train_this = args.skip_train or (
+            training_complete and args.reeval_completed and not args.force
+        )
+        if skip_train_this and training_complete and args.reeval_completed and not args.force:
+            print(
+                f"[SKIP TRAIN] {name}: {final_ckpt.name} exists; "
+                f"re-running eval pipeline only",
+                flush=True,
+            )
 
         train_ok  = True
         eval_ok   = True
@@ -328,7 +348,7 @@ def main() -> int:
         # ------------------------------------------------------------------
         # 1. TRAIN
         # ------------------------------------------------------------------
-        if not args.skip_train:
+        if not skip_train_this:
             cmd = [
                 sys.executable, str(repo_root / "train.py"),
                 "-s", str(scene_dir),
@@ -362,7 +382,7 @@ def main() -> int:
                     gaussian_count = _count_gaussians(ply)
 
         # ------------------------------------------------------------------
-        # 2. EVAL (before render: render_video.py reads results.txt for iteration)
+        # 2. EVAL (before render: render_video.py reads results.json for iteration)
         #    Only runs if training succeeded (or was skipped).
         # ------------------------------------------------------------------
         if not args.skip_eval and train_ok:
@@ -514,29 +534,32 @@ def main() -> int:
                 failures.append(msg)
 
         # ------------------------------------------------------------------
-        # 5. Record Gaussian count into results.txt
+        # 5. Record Gaussian count in results.json
         # ------------------------------------------------------------------
         ply = _latest_ply(model_path)
         if ply is not None:
             gaussian_count = _count_gaussians(ply)
             if gaussian_count is not None:
-                results_file = model_path / "results.txt"
-                # Append if file already exists; write fresh otherwise
-                mode = "a" if results_file.is_file() else "w"
-                with results_file.open(mode) as f:
-                    f.write(f"Gaussian count: {gaussian_count}\n")
-                    f.write(f"PLY: {ply}\n")
+                save_results_json_merged(
+                    model_path,
+                    {
+                        "point_cloud_stats": {
+                            "gaussian_count": gaussian_count,
+                            "ply_path": str(ply),
+                        },
+                    },
+                )
                 print(f"[INFO] Gaussian primitives: {gaussian_count}")
 
         # ------------------------------------------------------------------
         # 6. CSV summary row
         # ------------------------------------------------------------------
-        results_txt = model_path / "results.txt"
-        if results_txt.is_file():
+        rjson = results_json_path(model_path)
+        if rjson.is_file():
             try:
-                results_rel = str(results_txt.relative_to(repo_root))
+                results_rel = str(rjson.relative_to(repo_root))
             except ValueError:
-                results_rel = str(results_txt)
+                results_rel = str(rjson)
         else:
             results_rel = ""
         with summary_path.open("a", newline="") as f:
@@ -546,12 +569,20 @@ def main() -> int:
                     "timestamp_utc", "scene",
                     "train_ok", "render_ok", "eval_ok",
                     "image_metrics_ok", "structure_ok",
-                    "gaussian_count", "results_txt",
+                    "gaussian_count", "results_json",
                 ])
                 write_header = False
+            if skip_train_this:
+                train_csv = (
+                    "skipped_complete"
+                    if training_complete and args.reeval_completed and not args.force
+                    else "skipped"
+                )
+            else:
+                train_csv = str(train_ok)
             w.writerow([
                 ts, name,
-                str(train_ok  if not args.skip_train  else "skipped"),
+                train_csv,
                 str(render_ok if not args.skip_render else "skipped"),
                 str(eval_ok   if not args.skip_eval   else "skipped"),
                 str(image_metrics_ok if not args.skip_image_metrics else "skipped"),

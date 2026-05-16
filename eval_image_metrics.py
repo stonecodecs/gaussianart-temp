@@ -1,15 +1,11 @@
 """
 Compute PSNR, SSIM, and LPIPS on the test set of a trained PartNet-Video scene.
 
-Reads the best iteration from ``<model>/results.txt`` (written by ``eval_axis.py``).
-Falls back to the latest checkpoint when ``results.txt`` is missing. Loads the
-trained Gaussians + articulation parameters, renders each test view (start-state
-views render canonically; end-state views render with articulation applied
-automatically inside ``gaussian_renderer.render``), then averages the metrics.
+Reads the best iteration from ``<model>/results.json`` (``axis_eval`` block from
+``eval_axis.py``), then the latest PLY checkpoint.
 
-Appends a results block to ``<model>/results.txt`` and prints the same numbers
-to stdout. Designed to be called by ``train_eval_all_pnv.py`` as a separate
-pipeline stage.
+Merges metrics into ``<model>/results.json`` under ``image_metrics`` (does not
+wipe ``axis_eval`` or other keys). Also prints the summary to stdout.
 
 Example::
 
@@ -18,7 +14,6 @@ Example::
 
 from __future__ import annotations
 
-import os
 import sys
 import warnings
 from argparse import ArgumentParser
@@ -32,21 +27,17 @@ from utils.loss_utils import ssim as ssim_fn
 from scene import Scene
 from gaussian_renderer import GaussianModel, render
 from arguments import ModelParams, PipelineParams, get_combined_args
+from utils.results_json import read_best_iteration, save_results_json_merged
 
 
 def _resolve_iteration(model_path: Path, override: int | None) -> int:
-    """Pick the iteration to evaluate: explicit > results.txt 'The best:' > latest PLY."""
+    """Pick iteration: explicit flag > results.json > latest PLY."""
     if override is not None and override > 0:
         return override
 
-    results = model_path / "results.txt"
-    if results.is_file():
-        try:
-            with results.open() as f:
-                first = f.readline()
-            return int(first.split(":")[-1].strip())
-        except Exception:
-            pass
+    bi = read_best_iteration(model_path)
+    if bi is not None:
+        return bi
 
     pc_root = model_path / "point_cloud"
     iters = sorted(
@@ -162,66 +153,52 @@ def evaluate(args) -> int:
     ssim_end   = _mean([r[3] for r in end])
     lpips_end  = _mean([r[4] for r in end])
 
-    block = []
-    block.append("")
-    block.append(
+    lines = [
+        "",
         f"--- Image metrics (test set, iter {iteration}, "
-        f"N={len(records)}: start={len(start)}, end={len(end)}) ---"
-    )
-    block.append(f"PSNR mean:  {psnr_mean:.4f}")
-    block.append(f"SSIM mean:  {ssim_mean:.4f}")
-    block.append(f"LPIPS mean: {lpips_mean:.4f}")
+        f"N={len(records)}: start={len(start)}, end={len(end)}) ---",
+        f"PSNR mean:  {psnr_mean:.4f}",
+        f"SSIM mean:  {ssim_mean:.4f}",
+        f"LPIPS mean: {lpips_mean:.4f}",
+    ]
     if start:
-        block.append(
-            f"start (time=0.0): PSNR={psnr_start:.4f}  SSIM={ssim_start:.4f}  LPIPS={lpips_start:.4f}"
+        lines.append(
+            "start (time=0.0): "
+            f"PSNR={psnr_start:.4f}  SSIM={ssim_start:.4f}  LPIPS={lpips_start:.4f}"
         )
     if end:
-        block.append(
-            f"end   (time=1.0): PSNR={psnr_end:.4f}  SSIM={ssim_end:.4f}  LPIPS={lpips_end:.4f}"
+        lines.append(
+            "end   (time=1.0): "
+            f"PSNR={psnr_end:.4f}  SSIM={ssim_end:.4f}  LPIPS={lpips_end:.4f}"
         )
+    print("\n".join(lines) + "\n")
 
-    text = "\n".join(block) + "\n"
-    print(text)
-    results_path = model_path / "results.txt"
-    _append_metrics_block(results_path, text)
+    image_metrics: dict = {
+        "iteration": int(iteration),
+        "num_views": len(records),
+        "num_start_views": len(start),
+        "num_end_views": len(end),
+        "psnr_mean": psnr_mean,
+        "ssim_mean": ssim_mean,
+        "lpips_mean": lpips_mean,
+        "lpips_network": "alex",
+    }
+    if start:
+        image_metrics["start"] = {
+            "psnr": psnr_start,
+            "ssim": ssim_start,
+            "lpips": lpips_start,
+        }
+    if end:
+        image_metrics["end"] = {
+            "psnr": psnr_end,
+            "ssim": ssim_end,
+            "lpips": lpips_end,
+        }
+
+    save_results_json_merged(model_path, {"image_metrics": image_metrics})
 
     return 0
-
-
-_METRICS_HEADER = "--- Image metrics (test set,"
-
-
-def _append_metrics_block(results_path: Path, block: str) -> None:
-    """Append ``block`` to ``results.txt``, replacing any prior image-metrics block.
-
-    Re-runs of this script should not accumulate duplicate metrics sections; we
-    detect previous sections by the ``_METRICS_HEADER`` marker and drop them
-    (plus the blank separator line directly above) before appending the new
-    block.
-    """
-    if results_path.is_file():
-        with results_path.open("r") as f:
-            lines = f.readlines()
-        kept: list[str] = []
-        skipping = False
-        for line in lines:
-            if line.startswith(_METRICS_HEADER):
-                skipping = True
-                # Drop the trailing blank separator that precedes the section.
-                while kept and kept[-1].strip() == "":
-                    kept.pop()
-                continue
-            if skipping:
-                # Stop skipping at the next blank line that follows the section,
-                # since each section is followed by a blank line.
-                if line.strip() == "":
-                    skipping = False
-                continue
-            kept.append(line)
-        with results_path.open("w") as f:
-            f.writelines(kept)
-    with results_path.open("a") as f:
-        f.write(block)
 
 
 # argparse plumbing -----------------------------------------------------------
@@ -238,7 +215,7 @@ def main() -> int:
     ModelParams_for_args  = ModelParams(parser, sentinel=True)
     PipelineParams_for_args = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int,
-                        help="Force a specific iteration; default reads 'The best' from results.txt.")
+                        help="Force iteration; default reads results.json / latest PLY.")
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
 

@@ -161,8 +161,9 @@ def main() -> int:
                         return r.returncode
 
         results_rel = ""
-        if (model_path / "results.txt").is_file():
-            results_rel = os.path.relpath(model_path / "results.txt", repo_root)
+        results_json = model_path / "results.json"
+        if results_json.is_file():
+            results_rel = os.path.relpath(results_json, repo_root)
 
         with summary_path.open("a", newline="") as f:
             w = csv.writer(f)
@@ -173,7 +174,7 @@ def main() -> int:
                         "scene",
                         "train_ok",
                         "eval_ok",
-                        "results_txt",
+                        "results_json",
                     ]
                 )
                 write_header = False

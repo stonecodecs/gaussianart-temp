@@ -92,36 +92,46 @@ def knn_indices_single_point(point_cloud, point, k):
     # 计算目标点与其他所有点之间的欧氏距离
     diffs = point_cloud - point.unsqueeze(0)  # 形状为 (N, 3)
     dists = torch.norm(diffs, dim=1)  # 形状为 (N,)
-    
+    N = dists.shape[0]
+    kk = min(int(k), max(N, 1))
+
     # 使用topk找到距离最小的k个点的索引
-    _, indices = torch.topk(dists, k=k, largest=False)
-    
+    _, indices = torch.topk(dists, k=kk, largest=False)
+
     return indices
 
 def knn_loss(gaussians : GaussianModel, articulation_weight, m=None):
     pc = gaussians.get_xyz
     N = pc.shape[0]
+    if N == 0:
+        return torch.zeros((), device=articulation_weight.device, dtype=articulation_weight.dtype)
     if m is None:
-        m = N // 3000
+        m = max(1, N // 3000)
+    else:
+        m = max(1, int(m))
     random_indices = torch.randint(0, N, (m, )).cuda()
-    accumulated_knn_loss = 0.
+    accumulated_knn_loss = torch.zeros((), device=pc.device, dtype=pc.dtype)
     k = 50
     for ind in random_indices:
         point = pc[ind, ...]
         sel_indices = knn_indices_single_point(pc, point, k=k)
-        accumulated_knn_loss += torch.abs(articulation_weight[sel_indices, ...] - \
+        accumulated_knn_loss += torch.abs(articulation_weight[sel_indices, ...] -
                                 articulation_weight[ind, ...].unsqueeze(0)).mean()
     accumulated_knn_loss /= m
-    
+
     return accumulated_knn_loss
 
 def arap_loss(gaussians : GaussianModel, articulation_weight, articulation_matrix, articulation_t, m=None):
     pc = gaussians.get_xyz
     N = pc.shape[0]
+    if N == 0:
+        return torch.zeros((), device=articulation_weight.device, dtype=articulation_weight.dtype)
     if m is None:
-        m = N // 3000
+        m = max(1, N // 3000)
+    else:
+        m = max(1, int(m))
     random_indices = torch.randint(0, N, (m, )).cuda()
-    accumulated_arap_loss = 0.
+    accumulated_arap_loss = torch.zeros((), device=pc.device, dtype=pc.dtype)
     k = 50
     for ind in random_indices:
         point = pc[ind, ...]
@@ -130,12 +140,12 @@ def arap_loss(gaussians : GaussianModel, articulation_weight, articulation_matri
         sel_weights = articulation_weight[sel_indices, ...]
         sel_trans = torch.einsum('nj, jx -> nx', sel_weights, articulation_t)
         sel_rot = torch.einsum('nj, jrc -> nrc', sel_weights, articulation_matrix)
-        local_arap_loss = (point[None, ...] - sel_neighbor_points + sel_trans[:1, ...] - sel_trans - 
+        local_arap_loss = (point[None, ...] - sel_neighbor_points + sel_trans[:1, ...] - sel_trans -
                                   torch.einsum('nij, nj -> ni', sel_rot, point[None, ...] - sel_neighbor_points))
         accumulated_arap_loss += local_arap_loss.abs().mean()
-        
+
     accumulated_arap_loss /= m
-    
+
     return accumulated_arap_loss
 
 def reproj(depth_map, intrinsics, w2c, depth_mask=None, pixs=None):

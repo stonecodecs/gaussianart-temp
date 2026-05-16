@@ -8,6 +8,7 @@ from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
 from utils.general_utils import safe_state, build_rotation, vis_depth
+from utils.results_json import read_best_iteration
 from utils.system_utils import searchForMaxIteration
 import torchvision
 from argparse import ArgumentParser
@@ -272,16 +273,13 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    results_path = os.path.join(args.model_path, "results.txt")
-    if os.path.isfile(results_path):
-        # Written by eval_axis.py: first line is "The best: <iter>"
-        with open(results_path, "r") as f:
-            iter_line = f.readline()
-        args.iteration = int(iter_line.split(":")[-1].strip())
+    bi = read_best_iteration(args.model_path)
+    if bi is not None:
+        args.iteration = bi
     elif args.iteration < 0:
         pc_root = os.path.join(args.model_path, "point_cloud")
         args.iteration = searchForMaxIteration(pc_root)
-        print(f"No results.txt; using latest point_cloud iteration {args.iteration}")
+        print(f"No results.json; using latest point_cloud iteration {args.iteration}")
 
     render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.N_frames)
         
