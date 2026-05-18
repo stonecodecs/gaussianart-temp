@@ -16,7 +16,11 @@ Outputs per scene::
     <output_dir>/<scene_name>/
         ckpts/ours_*.pth           ← articulation checkpoints (from train.py)
         point_cloud/               ← Gaussian splats
-        results.json               ← merged metrics (axis_eval, image_metrics, point_cloud_stats)
+        meshes/tsdf_mesh_*.ply     ← TSDF reconstructions (full, static, dynamic)
+        results.json               ← merged metrics (axis_eval, image_metrics, point_cloud_stats, chamfer_metrics)
+        train/ours_<iter>/renders/ ← dataset train views (render.py)
+        test/ours_<iter>/renders/  ← dataset test views (render.py)
+        video/                     ← orbital demo MP4 + frames (render_video.py)
         gaussian_structure_orbit.mp4  ← ellipsoid orbit (Open3D, DC colors, all Gaussians)
         error.txt                  ← only written when a stage fails
 
@@ -56,6 +60,10 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
 
 from utils.results_json import results_json_path, save_results_json_merged
 # Helpers
@@ -122,6 +130,59 @@ def _write_error(model_path: Path, scene: str, stage: str, detail: str) -> None:
     with (model_path / "error.txt").open("a") as f:
         ts = datetime.now(timezone.utc).isoformat()
         f.write(f"[{ts}] {stage} failed for {scene}\n{detail}\n\n")
+
+
+def _sample_surface(mesh: trimesh.Trimesh, n: int) -> np.ndarray:
+    """Sample n points uniformly from the mesh surface."""
+    pts, _ = trimesh.sample.sample_surface(mesh, n)
+    return pts
+
+
+def _chamfer_distance(pts_a: np.ndarray, pts_b: np.ndarray) -> float:
+    """
+    Compute symmetric Chamfer distance between two point clouds.
+    Returns mean squared distance (smaller is better).
+    """
+    tree_a = cKDTree(pts_a)
+    tree_b = cKDTree(pts_b)
+    d_ab, _ = tree_b.query(pts_a)  # nearest-neighbour distances A→B
+    d_ba, _ = tree_a.query(pts_b)  # nearest-neighbour distances B→A
+    cd = float(np.mean(d_ab ** 2) + np.mean(d_ba ** 2))
+    return cd
+
+
+def _compute_mesh_chamfer(
+    tsdf_mesh_path: Path,
+    gt_mesh_path: Path,
+    n_samples: int = 10_000
+) -> dict | None:
+    """
+    Compute Chamfer distance between TSDF reconstruction and GT mesh.
+    Returns dict with 'chamfer_distance' or None on error.
+    """
+    try:
+        if not tsdf_mesh_path.is_file():
+            return None
+        if not gt_mesh_path.is_file():
+            return None
+        
+        tsdf_mesh = trimesh.load(str(tsdf_mesh_path), force="mesh", process=False)
+        gt_mesh = trimesh.load(str(gt_mesh_path), force="mesh", process=False)
+        
+        # Ensure meshes have geometry
+        if not hasattr(tsdf_mesh, 'vertices') or len(tsdf_mesh.vertices) == 0:
+            return None
+        if not hasattr(gt_mesh, 'vertices') or len(gt_mesh.vertices) == 0:
+            return None
+        
+        pts_tsdf = _sample_surface(tsdf_mesh, n_samples)
+        pts_gt = _sample_surface(gt_mesh, n_samples)
+        
+        cd = _chamfer_distance(pts_tsdf, pts_gt)
+        return {"chamfer_distance": cd}
+    except Exception as e:
+        print(f"[CHAMFER] Error computing Chamfer distance: {e}", file=sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +252,8 @@ def main() -> int:
         action="store_true",
         dest="reeval_completed",
         help="If ours_<iterations>.pth exists, skip training but still run eval, "
-             "image metrics, render, and structure video (default: skip the whole scene)",
+             "image metrics, dataset render, orbital video, and structure video "
+             "(default: skip the whole scene)",
     )
     parser.add_argument("--skip-train",  action="store_true", help="Skip training")
     parser.add_argument("--skip-eval",   action="store_true", help="Skip axis evaluation")
@@ -201,11 +263,39 @@ def main() -> int:
         dest="skip_image_metrics",
         help="Skip eval_image_metrics.py (PSNR/SSIM/LPIPS on the test set)",
     )
-    parser.add_argument("--skip-render", action="store_true", help="Skip render_video step")
+    parser.add_argument(
+        "--skip-render",
+        action="store_true",
+        help="Skip render_video.py orbital demo (video/)",
+    )
+    parser.add_argument(
+        "--skip-dataset-render",
+        action="store_true",
+        dest="skip_dataset_render",
+        help="Skip render.py train/test views from dataset transforms",
+    )
+    parser.add_argument(
+        "--multiview-dir",
+        default="multiview_static",
+        help="Multiview folder under each scene passed to render.py",
+    )
     parser.add_argument(
         "--skip-structure-video",
         action="store_true",
         help="Skip scripts/vis_gaussian_structure.py orbital ellipsoid MP4",
+    )
+    parser.add_argument(
+        "--skip-tsdf-meshify",
+        action="store_true",
+        dest="skip_tsdf_meshify",
+        help="Skip TSDF mesh generation and Chamfer distance evaluation",
+    )
+    parser.add_argument(
+        "--tsdf-n-samples",
+        type=int,
+        default=10_000,
+        dest="tsdf_n_samples",
+        help="Number of surface samples for Chamfer distance (default: 10,000)",
     )
     parser.add_argument(
         "--summary",
@@ -342,7 +432,10 @@ def main() -> int:
         train_ok  = True
         eval_ok   = True
         render_ok = True
+        dataset_render_ok = True
         structure_ok = True
+        tsdf_ok = True
+        chamfer_results = {}
         gaussian_count: int | None = None
 
         # ------------------------------------------------------------------
@@ -453,7 +546,54 @@ def main() -> int:
                     failures.append(msg)
 
         # ------------------------------------------------------------------
-        # 3. RENDER (only runs if training succeeded or was skipped)
+        # 2c. DATASET RENDER (train/test PNGs from dataset transforms)
+        # ------------------------------------------------------------------
+        if not args.skip_dataset_render and train_ok:
+            views_render_script = repo_root / "render.py"
+            if not views_render_script.is_file():
+                dataset_render_ok = False
+                print(f"[RENDER-VIEWS] render.py not found, skipping.")
+            elif not (model_path / "cfg_args").is_file():
+                dataset_render_ok = False
+                msg = f"{name}: missing cfg_args, cannot run render.py"
+                print(msg, file=sys.stderr)
+                _write_error(model_path, name, "dataset_render", msg)
+                failures.append(msg)
+            else:
+                cmd = [
+                    sys.executable,
+                    str(views_render_script),
+                    "-m",
+                    str(model_path),
+                    "-s",
+                    str(scene_dir),
+                    "--multiview-dir",
+                    args.multiview_dir,
+                ]
+                print(f"[RENDER-VIEWS] {' '.join(cmd)}")
+                try:
+                    r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                    rc = r.returncode
+                except Exception as exc:
+                    rc = -1
+                    print(f"[RENDER-VIEWS] subprocess raised: {exc}", file=sys.stderr)
+                    _write_error(
+                        model_path, name, "dataset_render", traceback.format_exc()
+                    )
+                if rc != 0:
+                    dataset_render_ok = False
+                    msg = f"{name}: render.py exit {rc}"
+                    print(msg, file=sys.stderr)
+                    _write_error(
+                        model_path,
+                        name,
+                        "dataset_render",
+                        f"Exit code: {rc}\nCmd: {' '.join(cmd)}",
+                    )
+                    failures.append(msg)
+
+        # ------------------------------------------------------------------
+        # 3. ORBITAL VIDEO (render_video.py)
         # ------------------------------------------------------------------
         if not args.skip_render and train_ok:
             render_script = repo_root / "render_video.py"
@@ -534,7 +674,85 @@ def main() -> int:
                 failures.append(msg)
 
         # ------------------------------------------------------------------
-        # 5. Record Gaussian count in results.json
+        # 5. TSDF mesh generation and Chamfer distance evaluation
+        #    Requires training succeeded and cameras.json exists.
+        # ------------------------------------------------------------------
+        if (
+            not args.skip_tsdf_meshify
+            and train_ok
+            and (model_path / "cameras.json").is_file()
+        ):
+            tsdf_script = repo_root / "tsdf_meshify.py"
+            if not tsdf_script.is_file():
+                tsdf_ok = False
+                print(f"[TSDF] tsdf_meshify.py not found, skipping.")
+            else:
+                # Generate TSDF meshes for full, static, and dynamic parts
+                meshes_dir = model_path / "meshes"
+                
+                for mode in ["full", "static", "dynamic"]:
+                    cmd = [
+                        sys.executable,
+                        str(tsdf_script),
+                        "--object_root",
+                        str(model_path),
+                        "--partnet_root",
+                        str(data_root),
+                        "--mode",
+                        mode,
+                    ]
+                    print(f"[TSDF-{mode.upper()}] {' '.join(cmd)}")
+                    try:
+                        r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                        rc = r.returncode
+                    except Exception as exc:
+                        rc = -1
+                        print(f"[TSDF-{mode.upper()}] subprocess raised: {exc}", file=sys.stderr)
+                        _write_error(
+                            model_path, name, f"tsdf_{mode}", traceback.format_exc()
+                        )
+                    if rc != 0:
+                        tsdf_ok = False
+                        msg = f"{name}: tsdf_meshify.py ({mode}) exit {rc}"
+                        print(msg, file=sys.stderr)
+                        _write_error(
+                            model_path,
+                            name,
+                            f"tsdf_{mode}",
+                            f"Exit code: {rc}\nCmd: {' '.join(cmd)}",
+                        )
+                        failures.append(msg)
+                
+                # Compute Chamfer distances if TSDF generation succeeded
+                if tsdf_ok:
+                    print(f"[CHAMFER] Computing Chamfer distances for {name}...")
+                    for mode in ["full", "static", "dynamic"]:
+                        tsdf_mesh = meshes_dir / f"tsdf_mesh_{mode}.ply"
+                        gt_mesh = scene_dir / "multiview_static" / f"gt_{mode}.ply"
+                        
+                        result = _compute_mesh_chamfer(
+                            tsdf_mesh, gt_mesh, n_samples=args.tsdf_n_samples
+                        )
+                        if result is not None:
+                            chamfer_results[f"chamfer_{mode}"] = result["chamfer_distance"]
+                            print(
+                                f"[CHAMFER] {mode:8s}: CD = {result['chamfer_distance']:.6f}"
+                            )
+                        else:
+                            print(
+                                f"[CHAMFER] {mode:8s}: skipped (mesh not found or error)",
+                                file=sys.stderr,
+                            )
+                    
+                    # Save Chamfer results to results.json
+                    if chamfer_results:
+                        save_results_json_merged(
+                            model_path,
+                            {"chamfer_metrics": chamfer_results},
+                        )
+
+        # ------------------------------------------------------------------
+        # 6. Record Gaussian count in results.json
         # ------------------------------------------------------------------
         ply = _latest_ply(model_path)
         if ply is not None:
@@ -552,7 +770,7 @@ def main() -> int:
                 print(f"[INFO] Gaussian primitives: {gaussian_count}")
 
         # ------------------------------------------------------------------
-        # 6. CSV summary row
+        # 7. CSV summary row
         # ------------------------------------------------------------------
         rjson = results_json_path(model_path)
         if rjson.is_file():
@@ -567,9 +785,10 @@ def main() -> int:
             if write_header:
                 w.writerow([
                     "timestamp_utc", "scene",
-                    "train_ok", "render_ok", "eval_ok",
-                    "image_metrics_ok", "structure_ok",
-                    "gaussian_count", "results_json",
+                    "train_ok", "render_ok", "dataset_render_ok", "eval_ok",
+                    "image_metrics_ok", "structure_ok", "tsdf_ok",
+                    "gaussian_count", "chamfer_full", "chamfer_static", "chamfer_dynamic",
+                    "results_json",
                 ])
                 write_header = False
             if skip_train_this:
@@ -584,10 +803,15 @@ def main() -> int:
                 ts, name,
                 train_csv,
                 str(render_ok if not args.skip_render else "skipped"),
+                str(dataset_render_ok if not args.skip_dataset_render else "skipped"),
                 str(eval_ok   if not args.skip_eval   else "skipped"),
                 str(image_metrics_ok if not args.skip_image_metrics else "skipped"),
                 str(structure_ok if not args.skip_structure_video else "skipped"),
+                str(tsdf_ok if not args.skip_tsdf_meshify else "skipped"),
                 str(gaussian_count) if gaussian_count is not None else "",
+                f"{chamfer_results['chamfer_full']:.6f}" if 'chamfer_full' in chamfer_results else "",
+                f"{chamfer_results['chamfer_static']:.6f}" if 'chamfer_static' in chamfer_results else "",
+                f"{chamfer_results['chamfer_dynamic']:.6f}" if 'chamfer_dynamic' in chamfer_results else "",
                 results_rel,
             ])
 
