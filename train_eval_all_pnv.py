@@ -252,7 +252,7 @@ def main() -> int:
         action="store_true",
         dest="reeval_completed",
         help="If ours_<iterations>.pth exists, skip training but still run eval, "
-             "image metrics, dataset render, orbital video, and structure video "
+             "image metrics, dataset render, orbital video, axis video, and structure video "
              "(default: skip the whole scene)",
     )
     parser.add_argument("--skip-train",  action="store_true", help="Skip training")
@@ -283,6 +283,12 @@ def main() -> int:
         "--skip-structure-video",
         action="store_true",
         help="Skip scripts/vis_gaussian_structure.py orbital ellipsoid MP4",
+    )
+    parser.add_argument(
+        "--skip-axis-video",
+        action="store_true",
+        dest="skip_axis_video",
+        help="Skip scripts/render_axis_video.py (predicted axes in video/ours_<iter>/axis-output.mp4)",
     )
     parser.add_argument(
         "--skip-tsdf-meshify",
@@ -432,6 +438,7 @@ def main() -> int:
         train_ok  = True
         eval_ok   = True
         render_ok = True
+        axis_video_ok = True
         dataset_render_ok = True
         structure_ok = True
         tsdf_ok = True
@@ -619,6 +626,50 @@ def main() -> int:
                     print(msg, file=sys.stderr)
                     _write_error(model_path, name, "render",
                                  f"Exit code: {rc}\nCmd: {' '.join(cmd)}")
+                    failures.append(msg)
+
+        # ------------------------------------------------------------------
+        # 3b. Predicted axis / motion-base video (render_axis_video.py)
+        #     Uses best_iteration from results.json (written by eval_axis.py).
+        # ------------------------------------------------------------------
+        if (
+            not args.skip_axis_video
+            and train_ok
+            and (model_path / "cfg_args").is_file()
+        ):
+            axis_script = repo_root / "scripts" / "render_axis_video.py"
+            if not axis_script.is_file():
+                axis_video_ok = False
+                msg = f"{name}: render_axis_video.py not found"
+                print(f"[AXIS] {msg}", file=sys.stderr)
+                failures.append(msg)
+            else:
+                cmd = [
+                    sys.executable,
+                    str(axis_script),
+                    "-m",
+                    str(model_path),
+                ]
+                print(f"[AXIS] {' '.join(cmd)}")
+                try:
+                    r = subprocess.run(cmd, cwd=str(repo_root), env=env)
+                    rc = r.returncode
+                except Exception as exc:
+                    rc = -1
+                    print(f"[AXIS] subprocess raised: {exc}", file=sys.stderr)
+                    _write_error(
+                        model_path, name, "axis_video", traceback.format_exc()
+                    )
+                if rc != 0:
+                    axis_video_ok = False
+                    msg = f"{name}: render_axis_video.py exit {rc}"
+                    print(msg, file=sys.stderr)
+                    _write_error(
+                        model_path,
+                        name,
+                        "axis_video",
+                        f"Exit code: {rc}\nCmd: {' '.join(cmd)}",
+                    )
                     failures.append(msg)
 
         # ------------------------------------------------------------------

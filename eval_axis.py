@@ -133,7 +133,7 @@ def axis_metrics(motion, gt):
     return ang_err, pos_err
 
 def eval_axis(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool,
-              gt_path : str = None, legacy=True):
+              gt_path : str = None, legacy=False):
     source_path = dataset.source_path
 
     if gt_path is None:
